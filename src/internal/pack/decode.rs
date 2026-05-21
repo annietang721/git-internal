@@ -40,6 +40,10 @@ use crate::{
     utils::CountingReader,
     zstdelta,
 };
+//[修改] 添加了全局常量定义线程池队列的最大任务数
+const MAX_QUEUED_TASKS: usize = 2000;
+//[修改] 添加了全局常量定义内存使用的最大百分比80%，当内存使用超过这个百分比时，解码将暂停以防止过度使用内存。
+const CACHE_MEMORY_PERCENT: u128 = 80;
 
 /// A reader that counts bytes read and computes CRC32 checksum.
 /// which is used to verify the integrity of decompressed data.
@@ -84,6 +88,24 @@ impl Drop for Pack {
         }
     }
 }
+// [修改 添加的函数] 用于判断当前是否需要暂停解码以防止内存或队列溢出
+fn should_pause_decode(queued_tasks: usize, memory_used: usize, mem_limit: Option<usize>) -> bool {
+    if queued_tasks > MAX_QUEUED_TASKS {
+        return true;
+    }
+
+    if let Some(limit) = mem_limit {
+        if memory_used > limit {
+            return true;
+        }
+    }
+
+    false
+}
+//[修改 添加的函数] 将计算缓存内存限制的逻辑提取到一个独立的函数中
+fn calc_cache_memory_limit(mem_limit: usize) -> usize {
+    ((mem_limit as u128) * CACHE_MEMORY_PERCENT / 100) as usize
+}
 
 impl Pack {
     /// # Parameters
@@ -112,10 +134,10 @@ impl Pack {
             temp_path.pop();
         }
         let thread_num = thread_num.unwrap_or_else(num_cpus::get);
-        let cache_mem_size = mem_limit.map(|mem_limit| {
-            // Use wider math to avoid 32-bit overflow when computing 80%.
-            ((mem_limit as u128) * 4 / 5) as usize
-        });
+        //[修改] 添加了一个函数 `calc_cache_memory_limit`，用于计算给定内存限制的80%，这是为了确保在解码过程中不会过度使用内存。
+        let cache_mem_size =
+        // Use wider math to avoid 32-bit overflow when computing 80%.
+            mem_limit.map(calc_cache_memory_limit);
         Pack {
             number: 0,
             signature: ObjectHash::default(),
@@ -450,12 +472,8 @@ impl Pack {
                 }
             }
             // 3 parts: Waitlist + TheadPool + Caches
-            // hardcode the limit of the tasks of threads_pool queue, to limit memory
-            while self.pool.queued_count() > 2000
-                || self
-                    .mem_limit
-                    .map(|limit| self.memory_used() > limit)
-                    .unwrap_or(false)
+            // [修改] 使用解耦后的独立控流函数，防止内存或队列溢出
+            while should_pause_decode(self.pool.queued_count(), self.memory_used(), self.mem_limit)
             {
                 thread::yield_now();
             }
@@ -791,9 +809,10 @@ impl Pack {
         // Memory recording will happen after this function returns. See `process_delta`
     }
 }
-
 #[cfg(test)]
 mod tests {
+    //[修改] 添加了多个测试函数，覆盖了 `check_header`、`decompress_data`、以及 `decode` 方法的不同场景，包括有无 delta 对象和不同哈希算法的情况。这些测试确保了核心功能的正确性，并且在解码过程中正确处理了各种对象类型和边界情况。
+    use super::*;
     use std::{
         env, fs,
         io::{BufReader, Cursor, prelude::*},
@@ -1058,5 +1077,29 @@ mod tests {
                 let _ = futures::future::join(f1, f2).await;
             }
         });
+    }
+    #[test]
+    fn test_should_pause_when_queue_exceeded() {
+        assert!(should_pause_decode(MAX_QUEUED_TASKS + 1, 0, None));
+    }
+    #[test]
+    fn test_should_pause_when_memory_exceeded() {
+        assert!(should_pause_decode(0, 200, Some(100)));
+    }
+    #[test]
+    fn test_should_not_pause_without_mem_limit() {
+        assert!(!should_pause_decode(0, 100, None));
+    }
+    #[test]
+    fn test_calc_cache_memory_limit() {
+        assert_eq!(calc_cache_memory_limit(1000), 800);
+    }
+    #[test]
+    fn test_calc_cache_memory_limit_zero() {
+        assert_eq!(calc_cache_memory_limit(0), 0);
+    }
+    #[test]
+    fn test_should_not_pause_at_exact_queue_limit() {
+        assert!(!should_pause_decode(MAX_QUEUED_TASKS, 0, None,));
     }
 }

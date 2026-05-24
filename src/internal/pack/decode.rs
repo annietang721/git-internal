@@ -102,7 +102,7 @@ fn should_pause_decode(queued_tasks: usize, memory_used: usize, mem_limit: Optio
 
     false
 }
-//[修改 添加的函数] 将计算缓存内存限制的逻辑提取到一个独立的函数中
+//[修改 添加的函数] 将计算缓存内存限制的逻辑提取到一个独立的函数中，用于计算给定内存限制的80%，这是为了确保在解码过程中不会过度使用内存。
 fn calc_cache_memory_limit(mem_limit: usize) -> usize {
     ((mem_limit as u128) * CACHE_MEMORY_PERCENT / 100) as usize
 }
@@ -134,10 +134,8 @@ impl Pack {
             temp_path.pop();
         }
         let thread_num = thread_num.unwrap_or_else(num_cpus::get);
-        //[修改] 添加了一个函数 `calc_cache_memory_limit`，用于计算给定内存限制的80%，这是为了确保在解码过程中不会过度使用内存。
-        let cache_mem_size =
         // Use wider math to avoid 32-bit overflow when computing 80%.
-            mem_limit.map(calc_cache_memory_limit);
+        let cache_mem_size = mem_limit.map(calc_cache_memory_limit);
         Pack {
             number: 0,
             signature: ObjectHash::default(),
